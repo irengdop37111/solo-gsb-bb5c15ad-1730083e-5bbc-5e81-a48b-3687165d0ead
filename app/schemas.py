@@ -1,0 +1,167 @@
+"""API 请求模型。"""
+from __future__ import annotations
+
+from typing import Optional, Union
+
+from pydantic import BaseModel, Field
+
+
+class TextIn(BaseModel):
+    text: str = Field(default="", description="批量录入文本")
+
+
+class ConfigIn(BaseModel):
+    """规则参数。
+
+    金额字段接受 JSON 数字或十进制字符串（字符串用于精确传输接近
+    SQLite 64 位整数上限的超大金额，避免 JSON 浮点在传输中失真）；
+    不在此处做数值约束：非法值（含金额为负 / 两位以上小数 / 换算为分后
+    超出 SQLite 64 位整数范围）统一走核心层 build_config_from_input，
+    返回带字段名（location.param）的 CONFIG_BAD 定位错误（HTTP 422），
+    与试算草案等其他入口口径一致。
+
+    transfer_discount_text / daily_cap_text 为精确十进制文本伴生字段
+    （页面从 GET /api/config 的同名字段原样回填、未编辑即原样提交），
+    存在时优先于数字字段解析，保证超大金额原值往返；旧客户端不传时
+    行为与之前完全一致。
+    """
+    transfer_minutes: float = Field(description="换乘有效间隔（分钟），正整数")
+    transfer_discount: Union[float, str] = Field(
+        description="换乘抵扣额（元），非负、最多两位小数")
+    daily_cap: Union[float, str] = Field(
+        description="每卡每运营日封顶额（元），非负、最多两位小数")
+    day_split_hour: float = Field(description="运营日分界时刻（0-23 的整数小时）")
+    transfer_discount_text: Optional[str] = Field(
+        default=None,
+        description="换乘抵扣额精确十进制文本（元），存在时优先于 "
+                    "transfer_discount，供超大金额原值往返")
+    daily_cap_text: Optional[str] = Field(
+        default=None,
+        description="每日封顶额精确十进制文本（元），存在时优先于 "
+                    "daily_cap，供超大金额原值往返")
+
+
+class TrialConfigIn(BaseModel):
+    """规则试算对比的草案参数。
+
+    不在此处做数值约束：非法草案应走 core.build_config_from_input，
+    返回与正式核验一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    金额同样接受数字或十进制字符串（精确传输超大金额）；
+    *_text 伴生字段与 ConfigIn 同义（页面「复制当前参数到草案」
+    原样带入，试算全程只读，不保存任何配置）。
+    """
+    transfer_minutes: float = Field(description="草案：换乘有效间隔（分钟）")
+    transfer_discount: Union[float, str] = Field(description="草案：换乘抵扣额（元）")
+    daily_cap: Union[float, str] = Field(description="草案：每卡每运营日封顶额（元）")
+    day_split_hour: float = Field(description="草案：运营日分界时刻（0-23）")
+    transfer_discount_text: Optional[str] = Field(
+        default=None, description="草案：换乘抵扣额精确十进制文本（元）")
+    daily_cap_text: Optional[str] = Field(
+        default=None, description="草案：每日封顶额精确十进制文本（元）")
+
+
+class PeakAuditIn(BaseModel):
+    """站点闸机峰值审计参数。
+
+    不在此处做数值约束：非法参数应走核心层校验，
+    返回与其他接口一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    """
+    window_minutes: float = Field(
+        description="峰值统计窗口长度（分钟），取 1～120 的整数")
+    min_alert: float = Field(
+        default=1,
+        description="最低告警数；峰值刷卡数达到该值的组才标记告警")
+
+
+class MergePreviewIn(BaseModel):
+    """外部刷卡批次合并预览参数。
+
+    待导入记录文本与保存记录共用 parse_records_text 解析（解析错误按
+    原有定位错误返回）；容差不在此处约束，非法值走核心层校验，
+    返回与其他接口一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    """
+    text: str = Field(default="", description="待导入刷卡记录文本")
+    tolerance_seconds: float = Field(
+        description="重复判定时间容差（秒），取 0～120 的整数")
+
+
+class OdPublishIn(BaseModel):
+    """匿名客流 OD 发布参数。
+
+    不在此处做数值约束：非法参数应走核心层校验，
+    返回与其他接口一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    """
+    start_day: str = Field(description="运营日起始日期 YYYY-MM-DD（闭区间）")
+    end_day: str = Field(description="运营日结束日期 YYYY-MM-DD（闭区间）")
+    bucket_minutes: float = Field(
+        description="初始时间桶粒度（分钟），取 15 / 30 / 60 之一")
+    k: float = Field(
+        description="匿名阈值：每个发布区间内的去重卡数下限，取 2～50 的整数")
+
+
+class GateQueueIn(BaseModel):
+    """闸机容量排队推演参数。
+
+    不在此处做数值约束：非法参数应走核心层校验，
+    返回与其他接口一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    """
+    operating_day: str = Field(description="运营日 YYYY-MM-DD")
+    bucket_minutes: float = Field(
+        description="时间桶粒度（分钟），取 1 / 5 / 15 之一")
+    capacity: float = Field(
+        description="每桶通行能力（人次），不小于 1 的整数")
+    max_extra_buckets: float = Field(
+        description="最后一笔到达之后最多续算的空桶数，不小于 0 的整数")
+
+
+class PassBacktestIn(BaseModel):
+    """通票购买策略回测参数。
+
+    不在此处做数值约束：非法日期 / 产品应走核心层校验，
+    返回与其他接口一致的定位错误（HTTP 422）。
+    """
+    passes_text: str = Field(
+        default="",
+        description="通票产品文本，每行：名称, 价格（元）, 连续有效运营日数")
+    start_day: str = Field(description="运营日起始日期 YYYY-MM-DD（闭区间）")
+    end_day: str = Field(description="运营日结束日期 YYYY-MM-DD（闭区间）")
+
+
+class DisputeEditIn(BaseModel):
+    """单笔账单争议更正：按原始行号选择记录，仅可临时修改时刻或站点。
+
+    不在此处做数值约束：行号合法性、修改值合法性与同卡约束均走核心层
+    校验，返回与其他接口一致的定位错误（HTTP 422）。
+    """
+    line: float = Field(description="已保存刷卡记录的原始行号（正整数）")
+    time: Optional[str] = Field(
+        default=None, description="新时刻（可选；留空表示不修改时刻）")
+    station: Optional[str] = Field(
+        default=None, description="新站点（可选；留空表示不修改站点）")
+
+
+class DisputePreviewIn(BaseModel):
+    """账单争议更正预演参数。
+
+    一至两笔更正（同一卡的原始行号 + 新时刻 / 新站点）；笔数、同卡、
+    重复行号与修改值合法性均由核心层校验，返回 DISPUTE_* 定位错误。
+    """
+    edits: list[DisputeEditIn] = Field(
+        description="更正列表：1～2 笔同一卡记录的临时修改")
+
+
+class CompensationPreviewIn(BaseModel):
+    """服务中断补偿预览参数。
+
+    不在此处做数值约束：站点、起止时刻与金额的合法性均走核心层校验，
+    返回与其他接口一致的定位错误（HTTP 422，location.param 指明出错参数）。
+    """
+    station: str = Field(description="发生服务中断的站点名")
+    start_time: str = Field(
+        description="中断开始时刻（闭区间起点），如 2026-09-18 08:00:00")
+    end_time: str = Field(
+        description="中断结束时刻（闭区间终点），如 2026-09-18 09:00:00")
+    budget: Union[float, str] = Field(
+        description="补偿预算（元），非负、最多两位小数")
+    per_card_cap: Union[float, str] = Field(
+        description="单卡补偿上限（元），非负、最多两位小数")
