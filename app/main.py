@@ -260,13 +260,10 @@ def run_verify():
     """
     # 1) 一致快照：读取输入与数据版本后立即释放读锁
     with db.connect() as conn:
-        db.begin_snapshot(conn)
-        try:
+        with db.snapshot(conn):
             cfg = db.get_config(conn)
             stations, fares, records = db.load_domain(conn)
             version = db.get_data_version(conn)
-        finally:
-            conn.rollback()  # 只读快照：读完即释放，不持锁计算
 
     # 2) 纯内存计算：不持有数据库连接 / 写锁
     result = verify(stations, fares, records, cfg)
@@ -293,9 +290,14 @@ def run_verify():
 
 @app.get("/api/bills")
 def get_bills():
+    # 账单与核验时间必须来自同一提交快照：并发保存（清空账单与核验时间）
+    # 或并发核验（写入账单与核验时间）若恰好在两次读取之间提交，响应会
+    # 拼到两个版本（典型：有行程却无核验时间）。同一读快照内读取即可
+    # 保证完整对应变化前或变化后的一版；读完即释放，再做只读序列化。
     with db.connect() as conn:
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
+        with db.snapshot(conn):
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
     return {"items": serialize_bills(bills),
             "count": len(bills), "last_verified_at": last}
 
@@ -686,9 +688,14 @@ def run_pass_backtest(body: PassBacktestIn):
     passes, parse_errors = parse_passes_text(body.passes_text)
     if parse_errors:
         return _parse_error_response(parse_errors)
+    # 账单与核验时间在同一只读快照内读出：并发保存 / 核验若在分次读取
+    # 之间提交，回测会把「新账单 + 旧核验时间」（或反之）拼在一起，
+    # 错误地返回 NO_BILLS 或基于错误版本计算金额。读完即释放快照，
+    # 动态规划等只读计算在锁外进行。
     with db.connect() as conn:
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
+        with db.snapshot(conn):
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
     result = pass_backtest(bills, passes, body.start_day, body.end_day, last)
 
     if not result.ok:
@@ -733,13 +740,19 @@ def run_dispute_preview(body: DisputePreviewIn):
     """
     raw_edits = [{"line": e.line, "time": e.time, "station": e.station}
                  for e in body.edits]
+    # 配置、站点、票价、刷卡记录、账单与核验时间全部在同一只读快照内
+    # 读出：预演要拿「当前账单」与「同一版输入重算的更正方案」对比，
+    # 若分次读取时并发保存提交，账单可能对应旧记录而重算基于新记录，
+    # 新增 / 移除与补退款金额都会失真。读完即释放快照，verify() 重算
+    # 等只读计算全部在锁外进行（不写回记录、配置或账单）。
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
-        result = dispute_preview(
-            stations, fares, records, bills, cfg, raw_edits, last)
+        with db.snapshot(conn):
+            cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
+    result = dispute_preview(
+        stations, fares, records, bills, cfg, raw_edits, last)
 
     if not result.ok:
         return JSONResponse(
@@ -776,9 +789,14 @@ def run_compensation_preview(body: CompensationPreviewIn):
       时返回空结果；站点为空、区间非法或金额非法返回 422 定位错误；
     - 全程只读：不修改记录、配置，也不写入或清空账单。
     """
+    # 账单与核验时间在同一只读快照内读出，再在锁外做只读分配计算：
+    # 并发保存清空账单 / 并发核验换账单若发生在分次读取之间，预览会
+    # 基于另一版本的账单筛选行程、却带着不匹配的核验时间（或反之），
+    # 得出错误的补偿金额；同一快照保证响应完整对应某一版。
     with db.connect() as conn:
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
+        with db.snapshot(conn):
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
     result = compensation_preview(
         bills, body.station, body.start_time, body.end_time,
         body.budget, body.per_card_cap, last)

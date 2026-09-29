@@ -215,6 +215,26 @@ def begin_snapshot(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN")
 
 
+@contextmanager
+def snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """显式只读快照事务：with 块内的多次 SELECT 全部来自同一提交版本。
+
+    进入时 BEGIN（获得读快照），离开时立即 rollback 释放读锁，
+    后续计算应放在块外完成，避免持锁计算阻塞并发保存 / 核验。
+
+    用途：修复只读接口分次读取（如先读账单、再读核验时间）时的
+    「并发混读」——并发保存或核验恰好在两次 SELECT 之间提交，会让
+    同一次响应拼到不同提交版本（典型表现：有账单却无核验时间，
+    或账单与核验时间分属两次核验）。同一快照内读取则保证响应完整
+    对应变化前或变化后的某一版，绝不混合两版。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+
+
 def begin_write(conn: sqlite3.Connection) -> None:
     """开启显式写事务并立即获取写锁（BEGIN IMMEDIATE）。
 
