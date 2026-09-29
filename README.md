@@ -133,6 +133,14 @@ DB_PATH=./bus.db uvicorn app.main:app --host 0.0.0.0 --port 8000
    时间**；页面此时提示「数据已变化，请重新核验」并自动刷新账单。例如：核验
    读入 2 元票价后另一请求保存了 5 元票价，旧核验不会把 2 元账单写回；
    过期的失败核验也不会清掉另一请求刚生成的新账单。
+   **只读接口的一致快照**：账单查询（`GET /api/bills`）、通票回测、
+   账单争议更正预演、服务中断补偿预览及其他只读接口，在一次请求内所需
+   的多张表 / 多行数据（账单与核验时间；争议预演还需配置、站点、票价与
+   刷卡记录）都从**同一个显式读事务快照**读出，读完即释放快照再做只读
+   计算。并发保存或核验在两次读取之间整体替换数据时，响应完整对应
+   **变化前或变化后的一版**，不混合两版——因此不会出现「有行程却无
+   核验时间」，也不会把不同提交版本的账单、输入拼在一起给出错误的
+   账单判断或金额。
 7. **重复刷卡 / 时间逆序**：
    - 同卡两条记录时刻完全相同 → `DUPLICATE_SWIPE`（重复刷卡）
    - 同卡出站早于进站、或排序后存在逆序 → `TIME_REVERSED`（时间逆序）
@@ -513,6 +521,57 @@ curl -sS http://localhost:8000/api/config
 
 页面对 `409` 的处理：提示「数据已变化，请重新核验」并自动刷新账单区；
 成功与 `422` 定位错误的展示行为保持不变。
+
+### 只读接口的一致快照（并发读取不混版）
+
+所有需要在一个请求内读取多张表 / 多行数据的只读接口，都在**同一个显式
+读事务**（`BEGIN`，SQLite 一致快照）内一次性读出本请求所需的全部输入，
+随后立即 `rollback()` 释放快照，再进行纯内存的只读计算。保存与核验在
+**同一事务**内整体替换数据（账单 + 核验时间，或配置 / 站点 / 票价 /
+记录），因此并发交错时每次响应都**完整对应变化前或变化后的某一个已提交
+版本，绝不会把两个版本的输入拼在一起**。
+
+- `GET /api/bills`：账单与 `last_verified_at` 同快照。否则保存操作恰好在
+  两次读取之间清空账单时，会出现「有行程却无核验时间」（或反过来）的
+  混合响应。
+- `POST /api/pass-backtest`：账单与核验时间同快照，`NO_BILLS` 判定与
+  回测所用账单恒为同一版，不会出现「读到账单却按无账单报错」或反之。
+- `POST /api/dispute-preview`：配置、站点、票价、刷卡记录、账单与核验
+  时间六者同快照，「当前账单」与「已保存输入」必属同一提交点，新增 /
+  移除 / 差额与补收退款金额不会跨版本错配。
+- `POST /api/compensation-preview`：账单与核验时间同快照，受影响行程、
+  按卡实扣权重与补偿金额不会把新旧两版账单混算。
+- 其余只读接口（`/api/config`、`/api/trial-compare`、`/api/repair-preview`、
+  `/api/fare-path-audit`、`/api/duration-audit`、`/api/station-peak-audit`、
+  `/api/external-merge-preview`、`/api/od-flow-publish`、
+  `/api/gate-queue-sim`）同样先在一致快照内读入全部所需输入、释放后再
+  计算，保证并发保存期间响应只对应一版数据。
+
+读取期间仅持有短暂的 SHARED 读锁，读完即释放；计算阶段不持有任何
+数据库锁，不阻塞并发保存与核验。接口的请求 / 响应字段、错误码与只读
+行为均保持不变。调用示例（账单与三类预览）：
+
+```bash
+# 账单 + 核验时间来自同一提交点（不会出现有行程却无核验时间）
+curl -sS http://localhost:8000/api/bills
+
+# 通票回测：账单与核验时间同快照（无有效账单时返回 422 + NO_BILLS）
+curl -sS -X POST http://localhost:8000/api/pass-backtest \
+  -H 'Content-Type: application/json' \
+  -d '{"passes_text":"一日票, 6.00, 1\n",
+       "start_day":"2026-09-18","end_day":"2026-09-18"}'
+
+# 争议更正预演：配置/站点/票价/记录/账单/核验时间同快照
+curl -sS -X POST http://localhost:8000/api/dispute-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"edits":[{"line":2,"station":"科技园"}]}'
+
+# 服务中断补偿预览：账单与核验时间同快照
+curl -sS -X POST http://localhost:8000/api/compensation-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"station":"科技园","start_time":"2026-09-18 07:00:00",
+       "end_time":"2026-09-18 09:00:00","budget":10,"per_card_cap":10}'
+```
 
 ### `/api/trial-compare` 规则试算对比
 
@@ -1696,6 +1755,12 @@ python3 -m pytest tests/ -q
   JSON 带字段名），原配置、票价、账单与数据版本保持不变。
 - **事务原子性**：整批替换基础数据、核验写账单均在单事务内完成；核验失败时清空
   `trip_bill`，因此任何时刻读到的账单要么是上一次完整成功的结果，要么为空。
+  **只读请求的多次读取同样有原子边界**：每个只读接口在一个显式读事务
+  （`BEGIN` 一致快照）内一次性读出本请求所需的多张表 / 多行数据，立即
+  `rollback()` 释放快照后再做纯内存计算（仅短暂持有 SHARED 读锁，不阻塞
+  并发写入）。保存 / 核验在同一事务内整体替换数据，因此并发交错时一次
+  响应不会把两个提交版本的账单、核验时间或争议预演所需的配置 / 站点 /
+  票价 / 记录拼在一起。
   `/api/trial-compare`、`/api/repair-preview`、`/api/fare-path-audit`、
   `/api/duration-audit`、`/api/station-peak-audit`、
   `/api/external-merge-preview`、`/api/od-flow-publish`、

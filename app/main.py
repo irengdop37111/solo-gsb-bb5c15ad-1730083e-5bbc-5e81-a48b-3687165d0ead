@@ -120,8 +120,14 @@ class TempFileResponse(FileResponse):
 
 @app.get("/api/config")
 def get_config():
+    # 多个规则参数键在同一显式读事务（一致快照）内一次读出，
+    # 避免并发保存配置时两次读取分别落在更新前后（混合两版配置）。
     with db.connect() as conn:
-        cfg = db.get_config(conn)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+        finally:
+            conn.rollback()
     return {
         "transfer_minutes": cfg.transfer_minutes,
         "transfer_discount": yuan_of_cents(cfg.transfer_discount_cents),
@@ -293,9 +299,17 @@ def run_verify():
 
 @app.get("/api/bills")
 def get_bills():
+    # 账单与核验时间必须来自同一已提交快照：保存操作在同一事务内清空
+    # 账单并清除核验时间，若两次读取之间插入这样的提交，分开读会得到
+    # 「有行程却无核验时间」（或反之）的混合响应。显式读事务内一次读完，
+    # 立即释放快照后再序列化（只读计算不持锁）。
     with db.connect() as conn:
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
+        db.begin_snapshot(conn)
+        try:
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
+        finally:
+            conn.rollback()  # 只读快照：读完即释放，不持锁序列化
     return {"items": serialize_bills(bills),
             "count": len(bills), "last_verified_at": last}
 
@@ -317,46 +331,53 @@ def run_trial_compare(body: TrialConfigIn):
     - 两边均成功时返回按 (卡号, 卡内序号) 对齐的行程行、
       每张卡汇总与全批次汇总。
     """
+    # 一致快照：当前配置与已保存站点 / 票价 / 记录必须来自同一提交点，
+    # 避免并发保存把不同版本的配置与输入拼在一起；读完立即释放快照，
+    # 草案解析与双边计价均为纯内存只读计算，不持有数据库锁。
     with db.connect() as conn:
-        current_cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
+        db.begin_snapshot(conn)
+        try:
+            current_cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+        finally:
+            conn.rollback()
 
-        # 草案参数按与正式配置相同的规则解析（金额 -> 整数分）；
-        # 非法草案只影响 draft 分块，不读取 / 修改任何已保存数据。
-        # *_text 精确文本优先，保证「复制当前参数到草案」带入的
-        # 超大金额不被 JSON 浮点尾数改写而误报 CONFIG_BAD。
-        draft_cfg, draft_errors = build_config_from_input(
-            body.transfer_minutes, body.transfer_discount,
-            body.daily_cap, body.day_split_hour,
-            body.transfer_discount_text, body.daily_cap_text)
-        if draft_errors:
-            current = verify(stations, fares, records, current_cfg)
-            # 草案不合法时仍回显原始入参（与请求体一致），不做整数规整；
-            # *_text 为 None（旧客户端未传）时省略，形态与旧响应一致。
-            draft_config = {
-                "transfer_minutes": body.transfer_minutes,
-                "transfer_discount": body.transfer_discount,
-                "daily_cap": body.daily_cap,
-                "day_split_hour": body.day_split_hour,
-            }
-            if body.transfer_discount_text is not None:
-                draft_config["transfer_discount_text"] = \
-                    body.transfer_discount_text
-            if body.daily_cap_text is not None:
-                draft_config["daily_cap_text"] = body.daily_cap_text
-            return JSONResponse(
-                status_code=422,
-                content={
+    # 草案参数按与正式配置相同的规则解析（金额 -> 整数分）；
+    # 非法草案只影响 draft 分块，不读取 / 修改任何已保存数据。
+    # *_text 精确文本优先，保证「复制当前参数到草案」带入的
+    # 超大金额不被 JSON 浮点尾数改写而误报 CONFIG_BAD。
+    draft_cfg, draft_errors = build_config_from_input(
+        body.transfer_minutes, body.transfer_discount,
+        body.daily_cap, body.day_split_hour,
+        body.transfer_discount_text, body.daily_cap_text)
+    if draft_errors:
+        current = verify(stations, fares, records, current_cfg)
+        # 草案不合法时仍回显原始入参（与请求体一致），不做整数规整；
+        # *_text 为 None（旧客户端未传）时省略，形态与旧响应一致。
+        draft_config = {
+            "transfer_minutes": body.transfer_minutes,
+            "transfer_discount": body.transfer_discount,
+            "daily_cap": body.daily_cap,
+            "day_split_hour": body.day_split_hour,
+        }
+        if body.transfer_discount_text is not None:
+            draft_config["transfer_discount_text"] = \
+                body.transfer_discount_text
+        if body.daily_cap_text is not None:
+            draft_config["daily_cap_text"] = body.daily_cap_text
+        return JSONResponse(
+            status_code=422,
+            content={
+                "ok": False,
+                "current": trial_side_block(current_cfg, current),
+                "draft": {
+                    "config": draft_config,
                     "ok": False,
-                    "current": trial_side_block(current_cfg, current),
-                    "draft": {
-                        "config": draft_config,
-                        "ok": False,
-                        "errors": draft_errors,
-                    },
-                })
+                    "errors": draft_errors,
+                },
+            })
 
-        result = trial_compare(stations, fares, records, current_cfg, draft_cfg)
+    result = trial_compare(stations, fares, records, current_cfg, draft_cfg)
 
     if not result.ok:
         return JSONResponse(
@@ -392,10 +413,17 @@ def run_repair_preview():
       返回 422 与 verify() 的原有定位错误，不生成修复方案；
     - 全程只读：不保存记录、不写入也不清空账单。
     """
+    # 配置 / 站点 / 票价 / 记录在同一显式读事务（一致快照）内一次读出，
+    # 读完立即释放快照，再在内存中做只读搜索（不持有数据库锁）：
+    # 并发保存时响应完整对应变化前或变化后的一版，不混合两版输入。
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
-        result = repair_preview(stations, fares, records, cfg)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+        finally:
+            conn.rollback()
+    result = repair_preview(stations, fares, records, cfg)
 
     if not result.ok:
         return JSONResponse(
@@ -430,9 +458,13 @@ def run_fare_path_audit():
     - 全程只读：不修改票价矩阵、不写入也不清空账单。
     """
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
-        result = fare_path_audit(stations, fares, records, cfg)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+        finally:
+            conn.rollback()
+    result = fare_path_audit(stations, fares, records, cfg)
 
     if not result.ok:
         return JSONResponse(
@@ -466,9 +498,13 @@ def run_duration_audit():
     - 全程只读：不修改记录、配置，也不写入或清空账单。
     """
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
-        result = duration_audit(stations, fares, records, cfg)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+        finally:
+            conn.rollback()
+    result = duration_audit(stations, fares, records, cfg)
 
     if not result.ok:
         return JSONResponse(
@@ -504,9 +540,13 @@ def run_station_peak_audit(body: PeakAuditIn):
     - 全程只读：不修改记录、配置，也不写入或清空账单。
     """
     with db.connect() as conn:
-        _stations, _fares, records = db.load_domain(conn)
-        result = station_peak_audit(
-            records, body.window_minutes, body.min_alert)
+        db.begin_snapshot(conn)
+        try:
+            _stations, _fares, records = db.load_domain(conn)
+        finally:
+            conn.rollback()
+    result = station_peak_audit(
+        records, body.window_minutes, body.min_alert)
 
     if not result.ok:
         return JSONResponse(
@@ -547,9 +587,13 @@ def run_external_merge_preview(body: MergePreviewIn):
     if parse_errors:
         return _parse_error_response(parse_errors)
     with db.connect() as conn:
-        _stations, _fares, base_records = db.load_domain(conn)
-        result = external_merge_preview(
-            base_records, import_records, body.tolerance_seconds)
+        db.begin_snapshot(conn)
+        try:
+            _stations, _fares, base_records = db.load_domain(conn)
+        finally:
+            conn.rollback()
+    result = external_merge_preview(
+        base_records, import_records, body.tolerance_seconds)
 
     if not result.ok:
         return JSONResponse(
@@ -591,12 +635,16 @@ def run_od_flow_publish(body: OdPublishIn):
     - 全程只读：不修改记录、配置，也不写入或清空账单。
     """
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
-        result = od_flow_publish(
-            stations, fares, records, cfg,
-            body.start_day, body.end_day,
-            body.bucket_minutes, body.k)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+        finally:
+            conn.rollback()
+    result = od_flow_publish(
+        stations, fares, records, cfg,
+        body.start_day, body.end_day,
+        body.bucket_minutes, body.k)
 
     if not result.ok:
         return JSONResponse(
@@ -637,12 +685,16 @@ def run_gate_queue_sim(body: GateQueueIn):
     - 参数非法（CONFIG_BAD）返回 422；全程只读：不修改记录、配置或账单。
     """
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        _stations, _fares, records = db.load_domain(conn)
-        result = gate_queue_sim(
-            records, cfg,
-            body.operating_day, body.bucket_minutes,
-            body.capacity, body.max_extra_buckets)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+            _stations, _fares, records = db.load_domain(conn)
+        finally:
+            conn.rollback()
+    result = gate_queue_sim(
+        records, cfg,
+        body.operating_day, body.bucket_minutes,
+        body.capacity, body.max_extra_buckets)
 
     if not result.ok:
         return JSONResponse(
@@ -686,9 +738,16 @@ def run_pass_backtest(body: PassBacktestIn):
     passes, parse_errors = parse_passes_text(body.passes_text)
     if parse_errors:
         return _parse_error_response(parse_errors)
+    # 账单与核验时间在同一显式读事务（一致快照）内一次读出：
+    # 账单可能在两次读取之间被并发保存 / 核验整体替换，分开读会把
+    # 新旧两版账单与核验时间拼在一起。读完立即释放快照，再做只读计算。
     with db.connect() as conn:
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
+        db.begin_snapshot(conn)
+        try:
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
+        finally:
+            conn.rollback()
     result = pass_backtest(bills, passes, body.start_day, body.end_day, last)
 
     if not result.ok:
@@ -733,13 +792,22 @@ def run_dispute_preview(body: DisputePreviewIn):
     """
     raw_edits = [{"line": e.line, "time": e.time, "station": e.station}
                  for e in body.edits]
+    # 配置、站点、票价、刷卡记录、账单与核验时间必须来自同一个已提交
+    # 快照：预演要用「当前账单」与「已保存输入」对比，若分别读取，
+    # 并发保存 / 核验可能把两个提交版本的输入与账单拼在一起，给出错误
+    # 的差额。显式读事务内一次读完后立即释放快照，再在内存中做只读的
+    # 原子替换、重新配对与计价（不持有数据库锁）。
     with db.connect() as conn:
-        cfg = db.get_config(conn)
-        stations, fares, records = db.load_domain(conn)
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
-        result = dispute_preview(
-            stations, fares, records, bills, cfg, raw_edits, last)
+        db.begin_snapshot(conn)
+        try:
+            cfg = db.get_config(conn)
+            stations, fares, records = db.load_domain(conn)
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
+        finally:
+            conn.rollback()
+    result = dispute_preview(
+        stations, fares, records, bills, cfg, raw_edits, last)
 
     if not result.ok:
         return JSONResponse(
@@ -776,9 +844,17 @@ def run_compensation_preview(body: CompensationPreviewIn):
       时返回空结果；站点为空、区间非法或金额非法返回 422 定位错误；
     - 全程只读：不修改记录、配置，也不写入或清空账单。
     """
+    # 账单与核验时间在同一显式读事务（一致快照）内一次读出：
+    # 并发保存 / 核验可能在两次读取之间整体替换账单，分开读会把
+    # 两版行程与核验时间拼在一起，导致受影响行程与补偿金额错误。
+    # 读完立即释放快照，再做纯内存的只读分配计算。
     with db.connect() as conn:
-        bills = db.list_bills(conn)
-        last = db.get_meta(conn, "last_verified_at")
+        db.begin_snapshot(conn)
+        try:
+            bills = db.list_bills(conn)
+            last = db.get_meta(conn, "last_verified_at")
+        finally:
+            conn.rollback()
     result = compensation_preview(
         bills, body.station, body.start_time, body.end_time,
         body.budget, body.per_card_cap, last)
